@@ -1,0 +1,27 @@
+simulation:
+  symbol: AAPL
+  n_ticks: 100
+  seed: 42
+
+strategy:
+  type: ma_crossover   # options: ma_crossover | random
+  fast_period: 5
+  slow_period: 20
+
+order_manager:
+  quantity: 100
+
+execution:
+  slippage_bps: 1
+  commission_per_share: 0.01
+
+risk:
+  max_position: 500
+  max_drawdown_pct: 10.0
+
+portfolio:
+  starting_cash: 100000.0
+
+persistence:
+  enabled: true
+  db_path: trading.db
