@@ -4,9 +4,13 @@ simulation:
   seed: 42
 
 strategy:
-  type: ma_crossover   # options: ma_crossover | random
+  type: ma_crossover   # options: ma_crossover | rsi | random
   fast_period: 5
   slow_period: 20
+  # RSI-specific (only used when type: rsi)
+  period: 14
+  overbought: 70.0
+  oversold: 30.0
 
 order_manager:
   quantity: 100
@@ -25,3 +29,14 @@ portfolio:
 persistence:
   enabled: true
   db_path: trading.db
+
+visualization:
+  enabled: false
+  save_path: equity_curve.png   # only used when enabled: true
+
+# To use real market data instead of synthetic, add these under simulation:
+# simulation:
+#   data_source: yfinance
+#   start: "2024-01-01"
+#   end:   "2024-12-31"
+#   interval: "1d"
