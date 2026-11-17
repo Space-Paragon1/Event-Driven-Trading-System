@@ -1,59 +1,101 @@
-"""Order manager — converts non-HOLD signals into market orders."""
+"""Order manager — converts signals into orders that move the position to a target."""
 
 from __future__ import annotations
 
-import uuid
-
 from trading.bus.event_bus import EventBus
-from trading.events.types import Direction, MarketDataEvent, OrderEvent, OrderType, SignalEvent
-
-_DEFAULT_QUANTITY = 100
+from trading.events.types import (
+    Direction,
+    FillEvent,
+    MarketDataEvent,
+    OrderEvent,
+    OrderType,
+    RiskVetoEvent,
+    SignalEvent,
+)
+from trading.portfolio.position import PositionBook
 
 
 class OrderManager:
-    """Subscribes to :class:`~trading.events.types.SignalEvent` and emits a
-    :class:`~trading.events.types.OrderEvent` for every BUY or SELL signal.
+    """Target-position order sizing.
 
-    Also subscribes to :class:`~trading.events.types.MarketDataEvent` to track
-    the latest close price per symbol, which is used as the reference price in
-    each order (enables accurate slippage simulation downstream).
+    Each non-HOLD signal sets a target position and the manager orders the
+    difference between that target and the *projected* position (filled plus
+    still-working orders):
 
-    HOLD signals are silently discarded.
+    ============  ==========================  =============================
+    Signal        ``allow_short=False``       ``allow_short=True``
+    ============  ==========================  =============================
+    BUY           target ``+quantity``        target ``+quantity``
+    SELL          target ``0`` (exit)         target ``-quantity``
+    HOLD          no order                    no order
+    ============  ==========================  =============================
+
+    Repeated signals in the same direction therefore never stack exposure, and
+    a vetoed order is removed from the projection so the next signal retries.
+
+    Orders are MARKET orders whose ``price`` is the last close, used downstream
+    as a reference price (execution fills at the next bar's open).
 
     Args:
-        quantity: Fixed lot size for every order (default ``100``).
+        quantity:    Absolute target position size in shares.
+        allow_short: Whether SELL signals may open short positions.
     """
 
-    def __init__(self, quantity: int = _DEFAULT_QUANTITY) -> None:
+    def __init__(self, quantity: int = 100, allow_short: bool = False) -> None:
+        if quantity <= 0:
+            raise ValueError(f"quantity must be positive, got {quantity}")
         self.quantity = quantity
+        self.allow_short = allow_short
         self._bus: EventBus | None = None
-        self._last_price: dict[str, float] = {}
+        self._book = PositionBook()
+        self._last_close: dict[str, float] = {}
+        self._next_id = 1
 
     def register(self, bus: EventBus) -> None:
         self._bus = bus
         bus.subscribe(MarketDataEvent, self._on_market_data)
         bus.subscribe(SignalEvent, self._on_signal)
+        bus.subscribe(FillEvent, self._book.on_fill)
+        bus.subscribe(RiskVetoEvent, self._on_veto)
 
     # ------------------------------------------------------------------
 
+    def target_for(self, direction: Direction) -> int | None:
+        """Target position implied by *direction*, or ``None`` to leave it unchanged."""
+        if direction is Direction.BUY:
+            return self.quantity
+        if direction is Direction.SELL:
+            return -self.quantity if self.allow_short else 0
+        return None
+
     def _on_market_data(self, event: MarketDataEvent) -> None:
-        self._last_price[event.symbol] = event.close
+        self._last_close[event.symbol] = event.close
+
+    def _on_veto(self, event: RiskVetoEvent) -> None:
+        self._book.cancel(event.order_id)
 
     def _on_signal(self, event: SignalEvent) -> None:
-        assert self._bus is not None, "register() must be called before emitting events"
-        if event.direction is Direction.HOLD:
+        if self._bus is None:
+            raise RuntimeError("OrderManager.register() must be called before use")
+
+        target = self.target_for(event.direction)
+        if target is None:
+            return
+        delta = target - self._book.projected(event.symbol)
+        if delta == 0:
             return
 
-        ref_price = self._last_price.get(event.symbol, 0.0)
-
+        order_id = f"O{self._next_id:06d}"
+        self._next_id += 1
+        self._book.add_working(order_id, event.symbol, delta)
         self._bus.publish(
             OrderEvent(
-                order_id=str(uuid.uuid4()),
                 symbol=event.symbol,
                 timestamp=event.timestamp,
+                order_id=order_id,
                 order_type=OrderType.MARKET,
-                direction=event.direction,
-                quantity=self.quantity,
-                price=ref_price,
+                direction=Direction.BUY if delta > 0 else Direction.SELL,
+                quantity=abs(delta),
+                price=self._last_close.get(event.symbol, 0.0),
             )
         )

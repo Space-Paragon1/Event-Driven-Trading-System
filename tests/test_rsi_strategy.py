@@ -2,83 +2,64 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
-
 import pytest
 
+from tests.factories import Capture, bars, publish_all
 from trading.bus.event_bus import EventBus
-from trading.events.types import Direction, MarketDataEvent, SignalEvent
+from trading.events.types import Direction, SignalEvent
 from trading.signal.rsi import RSIStrategy
 
-_BASE_TS = datetime(2024, 1, 2, 9, 30)
 
-
-def _make_event(close: float, i: int = 0) -> MarketDataEvent:
-    return MarketDataEvent(
-        symbol="AAPL",
-        timestamp=_BASE_TS + timedelta(days=i),
-        open=close,
-        high=close,
-        low=close,
-        close=close,
-        volume=1_000_000,
-    )
-
-
-def _run_prices(prices: list[float], period: int = 14,
-                overbought: float = 70.0, oversold: float = 30.0) -> list[SignalEvent]:
+def _signals(closes: list[float], period: int = 5, **kw: float) -> list[SignalEvent]:
     bus = EventBus()
-    signals: list[SignalEvent] = []
-    bus.subscribe(SignalEvent, signals.append)
-    RSIStrategy(period=period, overbought=overbought, oversold=oversold).register(bus)
-    for i, p in enumerate(prices):
-        bus.publish(_make_event(p, i))
-    bus.run()
-    return signals
+    RSIStrategy(period=period, **kw).register(bus)
+    cap = Capture(bus, SignalEvent)
+    publish_all(bus, *bars(closes))
+    return cap[SignalEvent]
+
+
+def _directions(closes: list[float], period: int = 5) -> list[Direction]:
+    return [s.direction for s in _signals(closes, period)]
 
 
 def test_hold_during_warmup() -> None:
-    # With period=5 we need 6 prices; send only 5
-    signals = _run_prices([100.0] * 5, period=5)
-    assert len(signals) == 5
-    assert all(s.direction is Direction.HOLD for s in signals)
+    # period=5 needs 6 prices before the first RSI value.
+    assert _directions([100.0, 99.0, 98.0, 97.0, 96.0]) == [Direction.HOLD] * 5
 
 
-def test_hold_in_neutral_zone() -> None:
-    # Flat prices → RSI = 100 (all gains, no losses after first) or 50;
-    # either way, no zone crossing → HOLD
-    signals = _run_prices([100.0] * 20, period=5)
-    assert all(s.direction is Direction.HOLD for s in signals)
+def test_hold_when_flat() -> None:
+    assert set(_directions([100.0] * 20)) == {Direction.HOLD}
 
 
-def test_buy_signal_on_oversold_crossover() -> None:
-    # Build a price series that pushes RSI below 30, then recover
-    # Sharp drop followed by a rise triggers oversold crossover → BUY
-    prices = [100.0] * 6 + [80.0, 70.0, 60.0, 55.0, 50.0] + [55.0, 60.0, 65.0]
-    signals = _run_prices(prices, period=5, oversold=30.0, overbought=70.0)
-    directions = [s.direction for s in signals]
-    assert Direction.BUY in directions
+def test_buy_when_rsi_crosses_into_oversold() -> None:
+    closes = [100.0] * 6 + [80.0, 70.0, 60.0, 55.0, 50.0, 55.0, 60.0, 65.0]
+    dirs = _directions(closes)
+    assert dirs.index(Direction.BUY) == 6  # first bar of the sell-off
+    assert dirs.count(Direction.BUY) == 1  # stays oversold: no repeated signals
 
 
-def test_sell_signal_on_overbought_crossover() -> None:
-    # Start with a declining series so RSI is below 70, then a sharp rise
-    # crosses RSI above 70 → SELL crossover.
-    # With period=5 (deque maxlen=6):
-    #   prices [100..90] → all declines, RSI=0 on 6th bar (first computed)
-    #   prices [95, 103, 115] → RSI climbs from ~38 → ~68 → ~86 (crosses 70)
-    prices = [100.0, 98.0, 96.0, 94.0, 92.0, 90.0, 95.0, 103.0, 115.0]
-    signals = _run_prices(prices, period=5, oversold=30.0, overbought=70.0)
-    directions = [s.direction for s in signals]
-    assert Direction.SELL in directions
+def test_sell_when_rsi_crosses_into_overbought() -> None:
+    # Wilder RSI(5): 0 -> 38.5 -> 65.2 -> 80.8, crossing 70 on the last bar.
+    closes = [100.0, 98.0, 96.0, 94.0, 92.0, 90.0, 95.0, 103.0, 115.0]
+    dirs = _directions(closes)
+    assert dirs[-1] is Direction.SELL
+    assert dirs.count(Direction.SELL) == 1
 
 
-def test_strength_in_range() -> None:
-    prices = list(range(100, 130))
-    signals = _run_prices(prices, period=5)
-    for s in signals:
+def test_strength_in_unit_interval() -> None:
+    for s in _signals([float(x) for x in range(100, 130)]):
         assert 0.0 <= s.strength <= 1.0
 
 
-def test_raises_if_period_too_small() -> None:
-    with pytest.raises(ValueError):
-        RSIStrategy(period=1)
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"period": 1},
+        {"oversold": 70.0, "overbought": 30.0},
+        {"oversold": -1.0},
+        {"overbought": 101.0},
+    ],
+)
+def test_invalid_parameters_raise(kwargs: dict[str, float]) -> None:
+    with pytest.raises(ValueError):  # noqa: PT011
+        RSIStrategy(**kwargs)  # type: ignore[arg-type]

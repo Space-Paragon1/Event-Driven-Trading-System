@@ -1,94 +1,97 @@
-"""Tests for PerformanceMetrics."""
+"""Tests for the PerformanceMetrics collector and report."""
 
 from __future__ import annotations
 
-from datetime import datetime
+import json
+import math
 
+import pytest
+
+from tests.factories import bar, fill, publish_all, snapshot
 from trading.bus.event_bus import EventBus
-from trading.events.types import Direction, FillEvent, PortfolioUpdateEvent
-from trading.metrics.calculator import PerformanceMetrics
+from trading.events.types import Direction
+from trading.metrics.calculator import PerformanceMetrics, PerformanceReport
 
-_TS = datetime(2024, 1, 2, 9, 30)
-_START = 100_000.0
-
-
-def _make_portfolio_event(equity: float, symbol: str = "AAPL",
-                          avg_cost: float = 150.0, position: int = 0) -> PortfolioUpdateEvent:
-    return PortfolioUpdateEvent(
-        symbol=symbol, timestamp=_TS,
-        position=position, avg_cost=avg_cost,
-        realized_pnl=0.0, unrealized_pnl=0.0,
-        cash=equity, equity=equity,
-    )
+START = 100_000.0
 
 
-def _make_fill(direction: Direction = Direction.BUY,
-               price: float = 150.0, qty: int = 100) -> FillEvent:
-    return FillEvent(
-        fill_id="fid", order_id="oid", symbol="AAPL", timestamp=_TS,
-        direction=direction, quantity=qty, fill_price=price, commission=0.0,
-    )
-
-
-def _run(events: list) -> PerformanceMetrics:
+def _report(*events: object, periods_per_year: float = 252) -> PerformanceReport:
     bus = EventBus()
-    m = PerformanceMetrics(starting_equity=_START)
+    m = PerformanceMetrics(starting_equity=START, periods_per_year=periods_per_year)
     m.register(bus)
-    for e in events:
-        bus.publish(e)
-    bus.run()
-    return m
+    publish_all(bus, *events)
+    return m.report()
 
 
-def test_positive_return() -> None:
-    m = _run([_make_portfolio_event(equity=110_000.0)])
-    r = m.report()
-    assert r.total_return_pct > 0
+def test_return_and_final_equity() -> None:
+    r = _report(snapshot(105_000.0, 0), snapshot(110_000.0, 1))
+    assert r.total_return_pct == pytest.approx(10.0)
+    assert r.final_equity == 110_000.0
+    assert r.n_bars == 2
 
 
-def test_negative_return() -> None:
-    m = _run([_make_portfolio_event(equity=90_000.0)])
-    r = m.report()
-    assert r.total_return_pct < 0
+def test_drawdown_is_measured_on_every_bar() -> None:
+    """Regression: equity used to be sampled only on fills, hiding intra-trade drawdowns."""
+    r = _report(snapshot(110_000.0, 0, position=100), snapshot(88_000.0, 1, position=100),
+                snapshot(111_000.0, 2, position=100))  # fmt: skip
+    assert r.max_drawdown_pct == pytest.approx(20.0)
+    assert r.max_drawdown_bars == 1
 
 
-def test_max_drawdown_detected() -> None:
-    events = [
-        _make_portfolio_event(110_000.0),   # new peak
-        _make_portfolio_event(99_000.0),    # drawdown from 110k
-    ]
-    m = _run(events)
-    r = m.report()
-    expected_dd = (110_000 - 99_000) / 110_000 * 100
-    assert abs(r.max_drawdown_pct - expected_dd) < 1e-3
+def test_win_rate_counts_round_trips_not_fills() -> None:
+    """Regression: every fill used to count as a 'trade', and buys could be 'wins'."""
+    r = _report(
+        fill(Direction.BUY, 100, 10.0, i=0),
+        fill(Direction.SELL, 100, 12.0, i=1),  # +200
+        fill(Direction.BUY, 100, 12.0, i=2),
+        fill(Direction.SELL, 100, 11.0, i=3),  # -100
+        fill(Direction.BUY, 100, 11.0, i=4),  # still open
+    )
+    assert r.total_fills == 5
+    assert r.total_trades == 2
+    assert r.win_rate_pct == pytest.approx(50.0)
+    assert r.profit_factor == pytest.approx(2.0)
+    assert r.avg_trade_pnl == pytest.approx(50.0)
 
 
-def test_win_rate_all_profitable() -> None:
-    # fills with price > avg_cost → profitable buys
-    m = PerformanceMetrics(starting_equity=_START)
-    bus = EventBus()
-    m.register(bus)
-    # first set avg_cost via a portfolio event
-    bus.publish(_make_portfolio_event(equity=_START, avg_cost=100.0, position=100))
-    # fill at price above avg_cost
-    bus.publish(_make_fill(direction=Direction.BUY, price=120.0))
-    bus.run()
-    r = m.report()
-    assert r.win_rate == 1.0
+def test_benchmark_and_exposure() -> None:
+    r = _report(
+        bar(100.0, 0), snapshot(START, 0, position=0),
+        bar(110.0, 1), snapshot(START, 1, position=100),
+        bar(120.0, 2), snapshot(START, 2, position=100),
+        bar(125.0, 3), snapshot(START, 3, position=0),
+    )  # fmt: skip
+    assert r.benchmark_return_pct == pytest.approx(25.0)
+    assert r.exposure_pct == pytest.approx(50.0)
 
 
-def test_report_fields_present() -> None:
-    m = _run([_make_portfolio_event(105_000.0)])
-    r = m.report()
-    assert hasattr(r, "total_return_pct")
-    assert hasattr(r, "max_drawdown_pct")
-    assert hasattr(r, "sharpe_ratio")
-    assert hasattr(r, "win_rate")
-    assert hasattr(r, "total_trades")
-    assert hasattr(r, "final_equity")
+def test_annualisation_uses_periods_per_year() -> None:
+    events = [snapshot(START * (1 + 0.01 * ((-1) ** i)), i) for i in range(20)]
+    daily = _report(*events, periods_per_year=252)
+    weekly = _report(*events, periods_per_year=52)
+    # Report values are rounded to 4 dp, hence the loose tolerance.
+    assert daily.sharpe_ratio / weekly.sharpe_ratio == pytest.approx(math.sqrt(252 / 52), rel=1e-3)
 
 
-def test_zero_trades_win_rate() -> None:
-    m = _run([])
-    assert m.report().win_rate == 0.0
-    assert m.report().total_trades == 0
+def test_empty_run_reports_zeros() -> None:
+    r = _report()
+    assert (r.total_trades, r.win_rate_pct, r.sharpe_ratio, r.final_equity) == (0, 0.0, 0.0, START)
+
+
+def test_to_dict_is_json_safe() -> None:
+    r = _report(snapshot(101_000.0, 0), snapshot(102_000.0, 1))  # no drawdown -> Calmar = inf
+    assert math.isinf(r.calmar_ratio)
+    d = r.to_dict()
+    assert d["calmar_ratio"] is None
+    json.dumps(d, allow_nan=False)
+
+
+def test_str_contains_key_metrics() -> None:
+    text = str(_report(snapshot(101_000.0, 0)))
+    for label in ("PERFORMANCE REPORT", "Total return", "Sharpe ratio", "Max drawdown", "Win rate"):
+        assert label in text
+
+
+def test_invalid_periods_per_year() -> None:
+    with pytest.raises(ValueError, match="periods_per_year"):
+        PerformanceMetrics(periods_per_year=0)

@@ -2,95 +2,104 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+import pytest
 
+from tests.factories import Capture, fill, order, publish_all, snapshot
 from trading.bus.event_bus import EventBus
-from trading.events.types import (
-    ApprovedOrderEvent,
-    Direction,
-    OrderEvent,
-    OrderType,
-    PortfolioUpdateEvent,
-    RiskVetoEvent,
-)
+from trading.events.types import ApprovedOrderEvent, Direction, RiskVetoEvent
 from trading.risk.manager import RiskManager
 
-_TS = datetime(2024, 1, 2, 9, 30)
+BUY, SELL = Direction.BUY, Direction.SELL
 
 
-def _make_order(direction: Direction = Direction.BUY, qty: int = 100) -> OrderEvent:
-    return OrderEvent(
-        order_id="oid-001",
-        symbol="AAPL",
-        timestamp=_TS,
-        order_type=OrderType.MARKET,
-        direction=direction,
-        quantity=qty,
-        price=150.0,
-    )
-
-
-def _run(order: OrderEvent, risk: RiskManager) -> tuple[list[ApprovedOrderEvent], list[RiskVetoEvent]]:
+def _run(
+    risk: RiskManager, *events: object
+) -> tuple[list[ApprovedOrderEvent], list[RiskVetoEvent]]:
     bus = EventBus()
-    approved: list[ApprovedOrderEvent] = []
-    vetoed: list[RiskVetoEvent] = []
-    bus.subscribe(ApprovedOrderEvent, approved.append)
-    bus.subscribe(RiskVetoEvent, vetoed.append)
     risk.register(bus)
-    bus.publish(order)
-    bus.run()
-    return approved, vetoed
+    cap = Capture(bus, ApprovedOrderEvent, RiskVetoEvent)
+    publish_all(bus, *events)
+    return cap[ApprovedOrderEvent], cap[RiskVetoEvent]
 
 
-def test_valid_order_is_approved() -> None:
-    approved, vetoed = _run(_make_order(qty=100), RiskManager(max_position=500))
+def test_valid_order_is_approved_unchanged() -> None:
+    o = order(BUY, 50)
+    (a,), vetoed = _run(RiskManager(), o)
+    assert vetoed == []
+    assert (a.order_id, a.direction, a.quantity, a.price) == (o.order_id, BUY, 50, o.price)
+
+
+def test_order_over_position_limit_is_vetoed() -> None:
+    approved, (v,) = _run(RiskManager(max_position=500), order(BUY, 600))
+    assert approved == []
+    assert v.order_id == "O1"
+    assert "position limit" in v.reason
+
+
+def test_position_limit_counts_working_orders() -> None:
+    """Two approved-but-unfilled orders must not jointly breach the limit."""
+    approved, vetoed = _run(
+        RiskManager(max_position=150),
+        order(BUY, 100, order_id="O1"),
+        order(BUY, 100, order_id="O2"),
+    )
+    assert [a.order_id for a in approved] == ["O1"]
+    assert [v.order_id for v in vetoed] == ["O2"]
+
+
+def test_position_limit_counts_filled_position() -> None:
+    approved, vetoed = _run(
+        RiskManager(max_position=150),
+        order(BUY, 100, order_id="O1"),
+        fill(BUY, 100, order_id="O1"),
+        order(BUY, 100, order_id="O2"),
+    )
     assert len(approved) == 1
-    assert len(vetoed) == 0
-
-
-def test_approved_order_mirrors_original() -> None:
-    order = _make_order(qty=50)
-    approved, _ = _run(order, RiskManager())
-    a = approved[0]
-    assert a.order_id == order.order_id
-    assert a.direction == order.direction
-    assert a.quantity == order.quantity
-
-
-def test_over_position_is_vetoed() -> None:
-    approved, vetoed = _run(_make_order(qty=600), RiskManager(max_position=500))
-    assert len(approved) == 0
     assert len(vetoed) == 1
-    assert "position limit" in vetoed[0].reason
 
 
-def test_max_drawdown_veto() -> None:
+def test_drawdown_breaker_vetoes_new_exposure() -> None:
     risk = RiskManager(max_drawdown_pct=5.0, starting_equity=100_000.0)
-    bus = EventBus()
-    approved: list[ApprovedOrderEvent] = []
-    vetoed: list[RiskVetoEvent] = []
-    bus.subscribe(ApprovedOrderEvent, approved.append)
-    bus.subscribe(RiskVetoEvent, vetoed.append)
-    risk.register(bus)
+    approved, (v,) = _run(risk, snapshot(94_000.0), order(BUY, 100))
+    assert approved == []
+    assert "drawdown" in v.reason
+    assert risk.drawdown_pct == pytest.approx(6.0)
 
-    # Simulate a big drawdown via a PortfolioUpdateEvent
-    bus.publish(
-        PortfolioUpdateEvent(
-            symbol="AAPL", timestamp=_TS,
-            position=0, avg_cost=0.0,
-            realized_pnl=0.0, unrealized_pnl=0.0,
-            cash=90_000.0, equity=90_000.0,  # 10% drawdown from 100k
-        )
+
+def test_drawdown_breaker_still_allows_reducing_orders() -> None:
+    approved, vetoed = _run(
+        RiskManager(max_drawdown_pct=5.0, starting_equity=100_000.0),
+        order(BUY, 100, order_id="O1"),
+        fill(BUY, 100, order_id="O1"),
+        snapshot(90_000.0, position=100),
+        order(SELL, 100, order_id="O2"),
     )
-    bus.publish(_make_order(qty=100))
-    bus.run()
+    assert [a.order_id for a in approved] == ["O1", "O2"]
+    assert vetoed == []
 
-    assert len(approved) == 0
+
+def test_drawdown_is_measured_from_running_peak() -> None:
+    risk = RiskManager(max_drawdown_pct=5.0, starting_equity=100_000.0)
+    _, vetoed = _run(risk, snapshot(120_000.0, 0), snapshot(112_000.0, 1), order(BUY, 10))
+    assert risk.drawdown_pct == pytest.approx(100 * 8_000 / 120_000)
     assert len(vetoed) == 1
-    assert "drawdown" in vetoed[0].reason
 
 
-def test_veto_contains_order_id() -> None:
-    order = _make_order(qty=600)
-    _, vetoed = _run(order, RiskManager(max_position=500))
-    assert vetoed[0].order_id == order.order_id
+def test_trading_resumes_after_recovery() -> None:
+    approved, vetoed = _run(
+        RiskManager(max_drawdown_pct=5.0, starting_equity=100_000.0),
+        snapshot(90_000.0, 0),
+        order(BUY, 10, order_id="O1"),
+        snapshot(99_000.0, 1),
+        order(BUY, 10, order_id="O2"),
+    )
+    assert [v.order_id for v in vetoed] == ["O1"]
+    assert [a.order_id for a in approved] == ["O2"]
+
+
+@pytest.mark.parametrize(
+    "kwargs", [{"max_position": 0}, {"max_drawdown_pct": 0.0}, {"max_drawdown_pct": 150.0}]
+)
+def test_invalid_limits_raise(kwargs: dict[str, float]) -> None:
+    with pytest.raises(ValueError):  # noqa: PT011
+        RiskManager(**kwargs)  # type: ignore[arg-type]

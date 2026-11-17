@@ -1,49 +1,55 @@
-"""Tests for MarketDataFeed."""
+"""Tests for SyntheticFeed."""
 
 from __future__ import annotations
 
-from trading.bus.event_bus import EventBus
-from trading.events.types import MarketDataEvent
-from trading.market_data.feed import MarketDataFeed
+import pytest
+
+from trading.market_data.feed import SyntheticFeed
 
 
-def _collect_events(n_ticks: int, seed: int = 0) -> list[MarketDataEvent]:
-    bus = EventBus()
-    events: list[MarketDataEvent] = []
-    bus.subscribe(MarketDataEvent, events.append)
-    feed = MarketDataFeed(symbol="TEST", n_ticks=n_ticks, seed=seed)
-    feed.emit(bus)
-    bus.run()
-    return events
+def test_emits_requested_number_of_bars() -> None:
+    assert len(list(SyntheticFeed("TEST", n_bars=37, seed=0))) == 37
 
 
-def test_feed_emits_correct_number_of_ticks() -> None:
-    events = _collect_events(n_ticks=5)
-    assert len(events) == 5
+def test_symbol_attached() -> None:
+    assert all(b.symbol == "MSFT" for b in SyntheticFeed("MSFT", n_bars=5, seed=1))
 
 
-def test_feed_emits_correct_symbol() -> None:
-    bus = EventBus()
-    events: list[MarketDataEvent] = []
-    bus.subscribe(MarketDataEvent, events.append)
-    MarketDataFeed(symbol="MSFT", n_ticks=3, seed=1).emit(bus)
-    bus.run()
-    assert all(e.symbol == "MSFT" for e in events)
+def test_deterministic_for_seed() -> None:
+    assert list(SyntheticFeed("X", n_bars=50, seed=7)) == list(
+        SyntheticFeed("X", n_bars=50, seed=7)
+    )
+    assert list(SyntheticFeed("X", n_bars=50, seed=7)) != list(
+        SyntheticFeed("X", n_bars=50, seed=8)
+    )
+
+
+def test_iterating_twice_replays_the_same_bars() -> None:
+    feed = SyntheticFeed("X", n_bars=20, seed=3)
+    assert list(feed) == list(feed)
 
 
 def test_ohlcv_constraints() -> None:
-    events = _collect_events(n_ticks=20, seed=99)
-    for e in events:
-        assert e.high >= e.open, "high must be >= open"
-        assert e.high >= e.close, "high must be >= close"
-        assert e.low <= e.open, "low must be <= open"
-        assert e.low <= e.close, "low must be <= close"
-        assert e.volume > 0, "volume must be positive"
-        assert e.close > 0, "close must be positive"
+    for b in SyntheticFeed("TEST", n_bars=500, seed=99, annual_volatility=0.8):
+        assert b.low <= min(b.open, b.close) <= max(b.open, b.close) <= b.high
+        assert b.low > 0
+        assert b.volume > 0
 
 
-def test_timestamps_are_strictly_increasing() -> None:
-    events = _collect_events(n_ticks=10, seed=7)
-    timestamps = [e.timestamp for e in events]
-    assert timestamps == sorted(timestamps)
-    assert len(set(timestamps)) == len(timestamps), "timestamps must be unique"
+def test_timestamps_are_increasing_weekdays() -> None:
+    stamps = [b.timestamp for b in SyntheticFeed("TEST", n_bars=30, seed=7)]
+    assert stamps == sorted(set(stamps))
+    assert all(t.weekday() < 5 for t in stamps)
+
+
+def test_zero_volatility_follows_drift_deterministically() -> None:
+    closes = [b.close for b in SyntheticFeed("X", n_bars=10, seed=1, annual_volatility=0.0)]
+    assert closes == sorted(closes)  # positive drift, no noise
+
+
+@pytest.mark.parametrize(
+    "kwargs", [{"n_bars": -1}, {"start_price": 0.0}, {"annual_volatility": -0.1}]
+)
+def test_invalid_parameters_raise(kwargs: dict[str, float]) -> None:
+    with pytest.raises(ValueError):  # noqa: PT011
+        SyntheticFeed("X", **kwargs)  # type: ignore[arg-type]

@@ -2,103 +2,81 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+import pytest
 
+from tests.factories import Capture, bar, end_of_bar, fill, publish_all
 from trading.bus.event_bus import EventBus
-from trading.events.types import Direction, FillEvent, MarketDataEvent, PortfolioUpdateEvent
+from trading.events.types import Direction, PortfolioUpdateEvent
 from trading.portfolio.tracker import PortfolioTracker
 
-_TS = datetime(2024, 1, 2, 9, 30)
-_STARTING_CASH = 100_000.0
+CASH = 100_000.0
 
 
-def _make_fill(direction: Direction, qty: int = 100, price: float = 150.0,
-               commission: float = 1.0) -> FillEvent:
-    return FillEvent(
-        fill_id="fid-001",
-        order_id="oid-001",
-        symbol="AAPL",
-        timestamp=_TS,
-        direction=direction,
-        quantity=qty,
-        fill_price=price,
-        commission=commission,
-    )
-
-
-def _make_market_data(close: float) -> MarketDataEvent:
-    return MarketDataEvent(
-        symbol="AAPL", timestamp=_TS,
-        open=close, high=close, low=close, close=close, volume=1000,
-    )
-
-
-def _run_fills(fills: list[FillEvent],
-               market_data: list[MarketDataEvent] | None = None,
-               starting_cash: float = _STARTING_CASH) -> list[PortfolioUpdateEvent]:
+def _run(*events: object) -> tuple[PortfolioTracker, list[PortfolioUpdateEvent]]:
     bus = EventBus()
-    updates: list[PortfolioUpdateEvent] = []
-    bus.subscribe(PortfolioUpdateEvent, updates.append)
-    PortfolioTracker(starting_cash=starting_cash).register(bus)
-    for md in (market_data or []):
-        bus.publish(md)
-    for f in fills:
-        bus.publish(f)
-    bus.run()
-    return updates
+    tracker = PortfolioTracker(starting_cash=CASH)
+    tracker.register(bus)
+    cap = Capture(bus, PortfolioUpdateEvent)
+    publish_all(bus, *events)
+    return tracker, cap[PortfolioUpdateEvent]
 
 
-def test_buy_debits_cash() -> None:
-    updates = _run_fills([_make_fill(Direction.BUY, qty=100, price=150.0, commission=1.0)])
+def test_snapshot_published_only_at_end_of_bar() -> None:
+    _, updates = _run(bar(150.0), fill(Direction.BUY))
+    assert updates == []
+    _, updates = _run(bar(150.0), fill(Direction.BUY), end_of_bar())
     assert len(updates) == 1
-    u = updates[0]
-    expected_cash = _STARTING_CASH - 100 * 150.0 - 1.0
-    assert abs(u.cash - expected_cash) < 1e-4
 
 
-def test_sell_credits_cash() -> None:
-    # buy first then sell
-    updates = _run_fills([
-        _make_fill(Direction.BUY, qty=100, price=150.0, commission=1.0),
-        _make_fill(Direction.SELL, qty=100, price=155.0, commission=1.0),
-    ])
-    assert len(updates) == 2
-    final = updates[-1]
-    # cash after sell: (100k - 100*150 - 1) + (100*155 - 1) = 100k + 500 - 2
-    expected_cash = _STARTING_CASH + (155.0 - 150.0) * 100 - 2.0
-    assert abs(final.cash - expected_cash) < 1e-4
+def test_buy_debits_cash_including_commission() -> None:
+    tracker, _ = _run(fill(Direction.BUY, 100, 150.0, commission=1.0))
+    assert tracker.cash == pytest.approx(CASH - 15_000.0 - 1.0)
 
 
-def test_realized_pnl_on_sell() -> None:
-    updates = _run_fills([
-        _make_fill(Direction.BUY, qty=100, price=150.0, commission=0.0),
-        _make_fill(Direction.SELL, qty=100, price=160.0, commission=0.0),
-    ])
-    final = updates[-1]
-    assert abs(final.realized_pnl - 1000.0) < 1e-4  # (160-150)*100
-
-
-def test_position_zero_after_round_trip() -> None:
-    updates = _run_fills([
-        _make_fill(Direction.BUY, qty=100, price=150.0),
-        _make_fill(Direction.SELL, qty=100, price=155.0),
-    ])
-    assert updates[-1].position == 0
-
-
-def test_update_published_per_fill() -> None:
-    fills = [_make_fill(Direction.BUY) for _ in range(3)]
-    updates = _run_fills(fills)
-    assert len(updates) == 3
-
-
-def test_equity_includes_market_value() -> None:
-    md = _make_market_data(close=160.0)
-    updates = _run_fills(
-        [_make_fill(Direction.BUY, qty=100, price=150.0, commission=0.0)],
-        market_data=[md],
+def test_round_trip_cash_and_realized_pnl() -> None:
+    tracker, updates = _run(
+        bar(155.0),
+        fill(Direction.BUY, 100, 150.0, commission=1.0),
+        fill(Direction.SELL, 100, 155.0, commission=1.0),
+        end_of_bar(),
     )
+    u = updates[-1]
+    assert u.position == 0
+    assert u.realized_pnl == pytest.approx(500.0)
+    assert tracker.cash == pytest.approx(CASH + 500.0 - 2.0)
+
+
+def test_snapshot_marks_to_last_close() -> None:
+    _, updates = _run(bar(160.0), fill(Direction.BUY, 100, 150.0), end_of_bar())
     u = updates[0]
-    # equity = cash + position * last_price
-    expected = (_STARTING_CASH - 100 * 150.0) + 100 * 160.0
-    assert abs(u.equity - expected) < 1e-4
+    assert u.unrealized_pnl == pytest.approx(1_000.0)
+    assert u.equity == pytest.approx(CASH - 15_000.0 + 16_000.0)
+
+
+def test_short_position_accounting() -> None:
+    """Regression: shorting from flat used to report the full notional as realized P&L."""
+    _, updates = _run(bar(145.0), fill(Direction.SELL, 100, 150.0), end_of_bar())
+    u = updates[0]
+    assert u.position == -100
+    assert u.avg_cost == pytest.approx(150.0)
+    assert u.realized_pnl == 0.0
+    assert u.unrealized_pnl == pytest.approx(500.0)
+    assert u.cash == pytest.approx(CASH + 15_000.0)
+    assert u.equity == pytest.approx(CASH + 500.0)
+
+
+def test_equity_identity_holds_every_bar() -> None:
+    events: list[object] = []
+    closes = [100.0, 103.0, 98.0, 110.0, 95.0]
+    trades = {0: (Direction.BUY, 200), 2: (Direction.SELL, 300), 3: (Direction.BUY, 100)}
+    for i, close in enumerate(closes):
+        events.append(bar(close, i))
+        if i in trades:
+            d, q = trades[i]
+            events.append(fill(d, q, close, commission=0.5, i=i, order_id=f"O{i}"))
+        events.append(end_of_bar(i))
+    _, updates = _run(*events)
+
+    assert len(updates) == len(closes)
+    for u, close in zip(updates, closes, strict=True):
+        assert u.equity == pytest.approx(u.cash + u.position * close)

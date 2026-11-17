@@ -1,115 +1,141 @@
-"""Equity curve visualization — plots equity and drawdown after a backtest run."""
+"""Backtest chart: price with executions, equity vs. buy-and-hold, and drawdown."""
 
 from __future__ import annotations
 
-from datetime import datetime
+from pathlib import Path
+from typing import TYPE_CHECKING
 
-from trading.bus.event_bus import EventBus
-from trading.events.types import PortfolioUpdateEvent
+from trading.errors import MissingDependencyError
+from trading.events.types import Direction
+from trading.metrics.stats import drawdown_series
+
+if TYPE_CHECKING:
+    from matplotlib.figure import Figure
+
+    from trading.backtest.engine import BacktestResult
+
+_BLUE = "#2563eb"
+_GREY = "#94a3b8"
+_GREEN = "#16a34a"
+_RED = "#dc2626"
+_INK = "#0f172a"
 
 
-class EquityChart:
-    """Collects portfolio snapshots during a backtest and produces a two-panel chart:
+def plot_backtest(
+    result: BacktestResult,
+    save_path: str | Path | None = None,
+    *,
+    show: bool = False,
+) -> Figure:
+    """Render a three-panel chart of *result*.
 
-    - **Top panel** — equity curve with a dashed baseline and green/red fill
-      above/below the starting equity level.
-    - **Bottom panel** — running drawdown percentage (filled red area).
+    - **Price** with BUY (▲) and SELL (▼) fills marked where they executed.
+    - **Equity** against a buy-and-hold benchmark scaled to the same capital.
+    - **Drawdown** from the running equity peak.
 
-    Usage::
+    Args:
+        result:    Output of :meth:`BacktestEngine.run`.
+        save_path: Write the figure here (format from the extension: PNG, SVG, PDF …).
+        show:      Open an interactive window (requires a GUI backend).
 
-        chart = EquityChart()
-        chart.register(bus)
-        feed.emit(bus)
-        bus.run()
-        chart.plot(symbol="AAPL")                   # interactive window
-        chart.plot(symbol="AAPL", save_path="out.png")  # save to file
-
-    The chart component must be registered **before** ``bus.run()`` so it
-    receives all :class:`~trading.events.types.PortfolioUpdateEvent` events.
+    Returns:
+        The matplotlib :class:`~matplotlib.figure.Figure`.
     """
+    try:
+        import matplotlib.dates as mdates
+        from matplotlib.figure import Figure
+        from matplotlib.ticker import FuncFormatter
+    except ImportError as exc:  # pragma: no cover - exercised only without the extra
+        raise MissingDependencyError("matplotlib", "viz") from exc
 
-    def __init__(self) -> None:
-        self._timestamps: list[datetime] = []
-        self._equity: list[float] = []
+    if not result.equity_curve:
+        raise ValueError("result has no equity data to plot")
 
-    # ------------------------------------------------------------------
-
-    def register(self, bus: EventBus) -> None:
-        bus.subscribe(PortfolioUpdateEvent, self._on_portfolio_update)
-
-    def _on_portfolio_update(self, event: PortfolioUpdateEvent) -> None:
-        self._timestamps.append(event.timestamp)
-        self._equity.append(event.equity)
-
-    # ------------------------------------------------------------------
-
-    def plot(self, symbol: str = "", save_path: str | None = None) -> None:
-        """Render the equity curve and drawdown chart.
-
-        Args:
-            symbol:    Ticker label shown in the chart title.
-            save_path: If provided, save the figure to this path (PNG/PDF/SVG)
-                       instead of displaying an interactive window.
-        """
-        if not self._equity:
-            print("[EquityChart] No data to plot — run the backtest first.")
-            return
-
+    if show:
         import matplotlib.pyplot as plt
 
-        equity = self._equity
-        timestamps = self._timestamps
-        baseline = equity[0]
+        fig = plt.figure(figsize=(12, 8.5))
+    else:
+        fig = Figure(figsize=(12, 8.5))  # no pyplot: safe headless and in threads
 
-        # Compute running drawdown
-        peak = equity[0]
-        drawdown: list[float] = []
-        for e in equity:
-            if e > peak:
-                peak = e
-            dd = (peak - e) / peak * 100.0 if peak > 0 else 0.0
-            drawdown.append(dd)
+    axes = fig.subplots(3, 1, sharex=True, gridspec_kw={"height_ratios": [2.2, 2.2, 1]})
+    ax_px, ax_eq, ax_dd = axes
+    fig.subplots_adjust(hspace=0.06, left=0.08, right=0.97, top=0.9, bottom=0.07)
 
-        fig, (ax_eq, ax_dd) = plt.subplots(
-            2, 1,
-            figsize=(12, 7),
-            gridspec_kw={"height_ratios": [3, 1]},
-            sharex=True,
+    # --- Price + executions ---------------------------------------------------
+    px_t = [t for t, _ in result.prices]
+    px = [p for _, p in result.prices]
+    ax_px.plot(px_t, px, color=_INK, linewidth=1.1, label=f"{result.symbol} close")
+    for direction, marker, color in ((Direction.BUY, "^", _GREEN), (Direction.SELL, "v", _RED)):
+        fills = [f for f in result.fills if f.direction is direction]
+        ax_px.scatter(
+            [f.timestamp for f in fills],
+            [f.fill_price for f in fills],
+            marker=marker,
+            s=46,
+            color=color,
+            edgecolors="white",
+            linewidths=0.6,
+            zorder=3,
+            label=f"{direction.name.title()} fill",
         )
-        fig.subplots_adjust(hspace=0.05)
+    ax_px.set_ylabel("Price")
+    ax_px.legend(loc="best", fontsize=9, framealpha=0.9, edgecolor="none", ncol=3)
 
-        # --- Equity panel ---
-        ax_eq.plot(timestamps, equity, color="#1f77b4", linewidth=1.5, label="Equity")
-        ax_eq.axhline(baseline, color="grey", linestyle="--", linewidth=0.8, label="Baseline")
-        ax_eq.fill_between(
-            timestamps, equity, baseline,
-            where=[e >= baseline for e in equity],
-            color="green", alpha=0.12,
-        )
-        ax_eq.fill_between(
-            timestamps, equity, baseline,
-            where=[e < baseline for e in equity],
-            color="red", alpha=0.18,
-        )
-        title = f"Equity Curve{' — ' + symbol if symbol else ''}"
-        ax_eq.set_title(title, fontsize=13)
-        ax_eq.set_ylabel("Equity ($)")
-        ax_eq.legend(loc="upper left", fontsize=9)
-        ax_eq.grid(True, alpha=0.3)
-        ax_eq.yaxis.set_major_formatter(
-            plt.FuncFormatter(lambda x, _: f"${x:,.0f}")
-        )
+    # --- Equity vs benchmark -------------------------------------------------
+    eq_t = [t for t, _ in result.equity_curve]
+    eq = [e for _, e in result.equity_curve]
+    start = result.report.starting_equity
+    benchmark = [start * p / px[0] for p in px] if px and px[0] else []
+    ax_eq.plot(eq_t, eq, color=_BLUE, linewidth=1.6, label="Strategy")
+    if benchmark:
+        ax_eq.plot(px_t, benchmark, color=_GREY, linewidth=1.1, label="Buy & hold")
+    ax_eq.axhline(start, color=_GREY, linestyle=":", linewidth=0.8)
+    ax_eq.fill_between(eq_t, eq, start, where=[e >= start for e in eq], color=_GREEN, alpha=0.08)
+    ax_eq.fill_between(eq_t, eq, start, where=[e < start for e in eq], color=_RED, alpha=0.10)
+    ax_eq.set_ylabel("Equity")
+    ax_eq.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"${x:,.0f}"))
+    ax_eq.legend(loc="best", fontsize=9, framealpha=0.9, edgecolor="none", ncol=2)
 
-        # --- Drawdown panel ---
-        ax_dd.fill_between(timestamps, drawdown, 0, color="red", alpha=0.4)
-        ax_dd.set_ylabel("Drawdown (%)")
-        ax_dd.set_xlabel("Date")
-        ax_dd.invert_yaxis()
-        ax_dd.grid(True, alpha=0.3)
+    # --- Drawdown --------------------------------------------------------------
+    dd = [-100.0 * d for d in drawdown_series([start, *eq])[1:]]
+    ax_dd.fill_between(eq_t, dd, 0, color=_RED, alpha=0.35, linewidth=0)
+    ax_dd.plot(eq_t, dd, color=_RED, linewidth=0.8)
+    ax_dd.set_ylabel("Drawdown")
+    ax_dd.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"{x:.0f}%"))
 
-        if save_path:
-            fig.savefig(save_path, dpi=150, bbox_inches="tight")
-            print(f"[EquityChart] Chart saved to {save_path}")
-            plt.close(fig)
-        else:
-            plt.show()
+    for ax in axes:
+        ax.grid(True, color="#e2e8f0", linewidth=0.7)
+        ax.set_axisbelow(True)
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+    locator = mdates.AutoDateLocator()  # type: ignore[no-untyped-call]
+    ax_dd.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))  # type: ignore[no-untyped-call]
+
+    r = result.report
+    fig.suptitle(
+        f"{result.symbol} · {result.strategy}",
+        x=0.08,
+        y=0.975,
+        ha="left",
+        fontsize=14,
+        fontweight="bold",
+        color=_INK,
+    )
+    fig.text(
+        0.08,
+        0.935,
+        f"Return {r.total_return_pct:+.1f}%  (buy & hold {r.benchmark_return_pct:+.1f}%)   "
+        f"Sharpe {r.sharpe_ratio:.2f}   Max DD {r.max_drawdown_pct:.1f}%   "
+        f"Round trips {r.total_trades}   Win rate {r.win_rate_pct:.0f}%",
+        fontsize=10,
+        color="#475569",
+    )
+
+    if save_path is not None:
+        fig.savefig(save_path, dpi=150)
+    if show:
+        import matplotlib.pyplot as plt
+
+        plt.show()
+    return fig

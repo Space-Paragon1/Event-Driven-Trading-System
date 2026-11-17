@@ -2,103 +2,107 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
-from datetime import datetime
+from pathlib import Path
 
+import pytest
+
+from tests.factories import approved, bar, fill, order, publish_all, signal, snapshot, ts
 from trading.bus.event_bus import EventBus
-from trading.events.types import (
-    ApprovedOrderEvent,
-    Direction,
-    FillEvent,
-    MarketDataEvent,
-    OrderEvent,
-    OrderType,
-    PortfolioUpdateEvent,
-    RiskVetoEvent,
-    SignalEvent,
-)
-from trading.persistence.sqlite_writer import SQLiteWriter
+from trading.errors import DataError
+from trading.events.types import Direction, RiskVetoEvent
+from trading.persistence.sqlite_writer import SCHEMA_VERSION, SQLiteWriter
 
-_TS = datetime(2024, 1, 2, 9, 30)
+TABLES = (
+    "runs", "market_data", "signals", "orders", "approved_orders",
+    "risk_vetos", "fills", "portfolio_updates",
+)  # fmt: skip
 
 
-def _writer() -> SQLiteWriter:
-    return SQLiteWriter(db_path=":memory:")
+def _count(path: Path, table: str, run_id: str | None = None) -> int:
+    with sqlite3.connect(path) as conn:
+        if run_id is None:
+            return int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+        sql = f"SELECT COUNT(*) FROM {table} WHERE run_id = ?"
+        return int(conn.execute(sql, (run_id,)).fetchone()[0])
 
 
-def _bus_with_writer() -> tuple[EventBus, SQLiteWriter]:
+def _write_run(path: Path, run_id: str) -> None:
     bus = EventBus()
-    w = _writer()
-    w.register(bus)
-    return bus, w
+    with SQLiteWriter(str(path), run_id) as db:
+        db.start_run(symbol="AAPL", strategy="test", config={"k": 1})
+        db.register(bus)
+        publish_all(
+            bus,
+            bar(150.0),
+            signal(Direction.BUY),
+            order(),
+            approved(),
+            RiskVetoEvent(symbol="AAPL", timestamp=ts(), order_id="O2", reason="limit"),
+            fill(Direction.BUY),
+            snapshot(100_000.0),
+        )
+        db.finish_run({"total_return_pct": 1.5})
 
 
-def test_tables_created() -> None:
-    w = _writer()
-    tables = {
-        row[0]
-        for row in w._conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()
-    }
-    expected = {"market_data", "signals", "orders", "approved_orders",
-                "risk_vetos", "fills", "portfolio_updates"}
-    assert expected.issubset(tables)
-    w.close()
+def test_schema_is_created_and_versioned(tmp_path: Path) -> None:
+    path = tmp_path / "t.db"
+    SQLiteWriter(str(path), "r1").close()
+    with sqlite3.connect(path) as conn:
+        names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+    assert set(TABLES) <= names
+    assert version == SCHEMA_VERSION
 
 
-def test_market_data_row_inserted() -> None:
-    bus, w = _bus_with_writer()
-    bus.publish(MarketDataEvent("AAPL", _TS, 150.0, 151.0, 149.0, 150.5, 1_000_000))
-    bus.run()
-    count = w._conn.execute("SELECT COUNT(*) FROM market_data").fetchone()[0]
-    assert count == 1
-    w.close()
+def test_every_event_type_is_persisted_with_run_id(tmp_path: Path) -> None:
+    path = tmp_path / "t.db"
+    _write_run(path, "run-a")
+    for table in TABLES:
+        assert _count(path, table, "run-a") == 1, table
 
 
-def test_signal_row_inserted() -> None:
-    bus, w = _bus_with_writer()
-    bus.publish(SignalEvent("AAPL", _TS, Direction.BUY, 0.75))
-    bus.run()
-    assert w._conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0] == 1
-    w.close()
+def test_runs_are_kept_separate(tmp_path: Path) -> None:
+    path = tmp_path / "t.db"
+    _write_run(path, "run-a")
+    _write_run(path, "run-b")
+    assert _count(path, "fills") == 2
+    assert _count(path, "fills", "run-b") == 1
 
 
-def test_order_row_inserted() -> None:
-    bus, w = _bus_with_writer()
-    bus.publish(OrderEvent("oid", "AAPL", _TS, OrderType.MARKET, Direction.BUY, 100, 150.0))
-    bus.run()
-    assert w._conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == 1
-    w.close()
+def test_run_row_has_config_and_report(tmp_path: Path) -> None:
+    path = tmp_path / "t.db"
+    _write_run(path, "run-a")
+    with sqlite3.connect(path) as conn:
+        cfg, rep, finished = conn.execute(
+            "SELECT config_json, report_json, finished_at FROM runs WHERE run_id = 'run-a'"
+        ).fetchone()
+    assert json.loads(cfg) == {"k": 1}
+    assert json.loads(rep) == {"total_return_pct": 1.5}
+    assert finished is not None
 
 
-def test_approved_order_row_inserted() -> None:
-    bus, w = _bus_with_writer()
-    bus.publish(ApprovedOrderEvent("oid", "AAPL", _TS, OrderType.MARKET, Direction.BUY, 100, 150.0))
-    bus.run()
-    assert w._conn.execute("SELECT COUNT(*) FROM approved_orders").fetchone()[0] == 1
-    w.close()
+def test_exception_rolls_back_the_run(tmp_path: Path) -> None:
+    path = tmp_path / "t.db"
+
+    def crashing_run() -> None:
+        bus = EventBus()
+        with SQLiteWriter(str(path), "boom") as db:
+            db.start_run(symbol="AAPL", strategy="test", config={})
+            db.register(bus)
+            publish_all(bus, bar(1.0))
+            raise RuntimeError("crash mid-run")
+
+    with pytest.raises(RuntimeError, match="crash mid-run"):
+        crashing_run()
+    assert _count(path, "runs") == 0
+    assert _count(path, "market_data") == 0
 
 
-def test_risk_veto_row_inserted() -> None:
-    bus, w = _bus_with_writer()
-    bus.publish(RiskVetoEvent("oid", "AAPL", _TS, "test reason"))
-    bus.run()
-    assert w._conn.execute("SELECT COUNT(*) FROM risk_vetos").fetchone()[0] == 1
-    w.close()
-
-
-def test_fill_row_inserted() -> None:
-    bus, w = _bus_with_writer()
-    bus.publish(FillEvent("fid", "oid", "AAPL", _TS, Direction.BUY, 100, 150.5, 1.0))
-    bus.run()
-    assert w._conn.execute("SELECT COUNT(*) FROM fills").fetchone()[0] == 1
-    w.close()
-
-
-def test_portfolio_update_row_inserted() -> None:
-    bus, w = _bus_with_writer()
-    bus.publish(PortfolioUpdateEvent("AAPL", _TS, 100, 150.0, 0.0, 500.0, 85_000.0, 100_500.0))
-    bus.run()
-    assert w._conn.execute("SELECT COUNT(*) FROM portfolio_updates").fetchone()[0] == 1
-    w.close()
+def test_incompatible_legacy_schema_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE fills (fill_id TEXT)")
+    with pytest.raises(DataError, match="incompatible schema"):
+        SQLiteWriter(str(path), "r1")

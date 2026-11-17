@@ -1,30 +1,57 @@
+# Default backtest configuration.
+#
+# Every value here equals the built-in default (a test enforces this), so this
+# file doubles as a reference. Copy it, change what you need, and run:
+#
+#   trading-backtest --config my.yaml
+#
+# Unknown keys are rejected with a "did you mean" hint, so typos fail loudly.
+
 simulation:
   symbol: AAPL
-  n_ticks: 100
-  seed: 42
+  data_source: synthetic       # synthetic | csv | yfinance
+  seed: 42                     # synthetic prices and the random strategy
+
+  # synthetic: geometric Brownian motion on business days
+  n_bars: 252
+  start_price: 150.0
+  annual_drift: 0.08
+  annual_volatility: 0.25
+
+  # yfinance (pip install 'event-driven-trading-system[data]')
+  start: "2024-01-01"
+  end: "2024-12-31"            # exclusive
+  interval: 1d                 # 1d | 1wk | 1mo | 1h | ...
+
+  # csv: columns date,open,high,low,close,volume in ascending date order
+  csv_path: null
 
 strategy:
-  type: ma_crossover   # options: ma_crossover | rsi | random
-  fast_period: 5
-  slow_period: 20
-  # RSI-specific (only used when type: rsi)
-  period: 14
-  overbought: 70.0
-  oversold: 30.0
+  type: ma_crossover           # ma_crossover | rsi | random
+  fast_period: 5               # ma_crossover
+  slow_period: 20              # ma_crossover
+  period: 14                   # rsi (Wilder smoothing)
+  overbought: 70.0             # rsi
+  oversold: 30.0               # rsi
 
 order_manager:
-  quantity: 100
+  quantity: 100                # target position size, in shares
+  allow_short: false           # false: SELL exits to flat; true: SELL goes short
 
 execution:
-  slippage_bps: 1
+  slippage_bps: 1.0            # adverse: buys pay more, sells receive less
   commission_per_share: 0.01
 
 risk:
-  max_position: 500
-  max_drawdown_pct: 10.0
+  max_position: 500            # max absolute shares per symbol
+  max_drawdown_pct: 10.0       # block new exposure beyond this drawdown from peak
 
 portfolio:
   starting_cash: 100000.0
+
+metrics:
+  periods_per_year: null       # null = infer (252 for daily, 52 weekly, ...)
+  risk_free_rate: 0.0          # annual, for Sharpe and Sortino
 
 persistence:
   enabled: true
@@ -32,11 +59,4 @@ persistence:
 
 visualization:
   enabled: false
-  save_path: equity_curve.png   # only used when enabled: true
-
-# To use real market data instead of synthetic, add these under simulation:
-# simulation:
-#   data_source: yfinance
-#   start: "2024-01-01"
-#   end:   "2024-12-31"
-#   interval: "1d"
+  save_path: equity_curve.png  # null opens an interactive window instead

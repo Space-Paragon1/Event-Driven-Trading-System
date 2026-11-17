@@ -2,89 +2,85 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
-
 import pytest
 
+from tests.factories import Capture, bar, bars, publish_all
 from trading.bus.event_bus import EventBus
-from trading.events.types import Direction, MarketDataEvent, SignalEvent
+from trading.events.types import Direction, SignalEvent
 from trading.signal.ma_crossover import MACrossoverStrategy
 
-_START = datetime(2024, 1, 2, 9, 30)
 
-
-def _make_event(symbol: str, close: float, i: int = 0) -> MarketDataEvent:
-    return MarketDataEvent(
-        symbol=symbol,
-        timestamp=_START + timedelta(minutes=i),
-        open=close,
-        high=close,
-        low=close,
-        close=close,
-        volume=1000,
-    )
-
-
-def _run_prices(prices: list[float], fast: int = 3, slow: int = 5) -> list[SignalEvent]:
+def _signals(
+    closes: list[float], fast: int = 3, slow: int = 5, symbol: str = "X"
+) -> list[SignalEvent]:
     bus = EventBus()
-    signals: list[SignalEvent] = []
-    bus.subscribe(SignalEvent, signals.append)
     MACrossoverStrategy(fast=fast, slow=slow).register(bus)
-    for i, p in enumerate(prices):
-        bus.publish(_make_event("X", p, i))
-    bus.run()
-    return signals
+    cap = Capture(bus, SignalEvent)
+    publish_all(bus, *bars(closes, symbol=symbol))
+    return cap[SignalEvent]
+
+
+def _directions(closes: list[float], **kw: int) -> list[Direction]:
+    return [s.direction for s in _signals(closes, **kw)]  # type: ignore[arg-type]
 
 
 def test_hold_during_warmup() -> None:
-    # fewer than slow=5 bars → all HOLD
-    signals = _run_prices([100.0, 101.0, 102.0, 103.0])
-    assert all(s.direction is Direction.HOLD for s in signals)
+    assert _directions([100.0, 101.0, 102.0, 103.0]) == [Direction.HOLD] * 4
 
 
-def test_buy_on_upward_crossover() -> None:
-    # fast=3, slow=5
-    # build a sequence where fast crosses above slow
-    # declining prices (fast < slow), then a spike up
-    prices = [100.0, 99.0, 98.0, 97.0, 96.0,   # slow warm-up, all declining
-              110.0, 120.0, 130.0]               # spike — fast will cross above
-    signals = _run_prices(prices, fast=3, slow=5)
-    directions = [s.direction for s in signals]
-    assert Direction.BUY in directions
+def test_buy_on_the_upward_crossover_bar() -> None:
+    #           warm-up (fast < slow) ........  cross at index 5
+    closes = [100.0, 99.0, 98.0, 97.0, 96.0, 110.0, 120.0, 130.0]
+    dirs = _directions(closes)
+    assert dirs.index(Direction.BUY) == 5
+    assert dirs.count(Direction.BUY) == 1
 
 
-def test_sell_on_downward_crossover() -> None:
-    prices = [100.0, 101.0, 102.0, 103.0, 104.0,  # warm-up, rising
-              80.0, 60.0, 40.0]                    # sharp drop — fast crosses below
-    signals = _run_prices(prices, fast=3, slow=5)
-    directions = [s.direction for s in signals]
-    assert Direction.SELL in directions
+def test_sell_on_the_downward_crossover_bar() -> None:
+    closes = [100.0, 101.0, 102.0, 103.0, 104.0, 80.0, 60.0, 40.0]
+    dirs = _directions(closes)
+    assert dirs.index(Direction.SELL) == 5
+    assert Direction.BUY not in dirs
 
 
-def test_strength_in_range() -> None:
-    prices = [float(i) for i in range(1, 30)]
-    signals = _run_prices(prices, fast=3, slow=5)
-    for s in signals:
-        assert 0.0 <= s.strength
+def test_no_signal_without_a_cross() -> None:
+    assert set(_directions([float(i) for i in range(1, 30)])) == {Direction.HOLD}
 
 
-def test_one_signal_per_bar() -> None:
-    prices = [float(i) for i in range(1, 20)]
-    signals = _run_prices(prices)
-    assert len(signals) == len(prices)
+def test_strength_in_unit_interval() -> None:
+    for s in _signals([float(i) ** 2 for i in range(1, 30)]):
+        assert 0.0 <= s.strength <= 1.0
 
 
-def test_invalid_fast_slow_raises() -> None:
-    with pytest.raises(ValueError):
-        MACrossoverStrategy(fast=10, slow=5)
+def test_one_signal_per_bar_with_bar_timestamp() -> None:
+    closes = [float(i) for i in range(1, 20)]
+    signals = _signals(closes)
+    assert [s.timestamp for s in signals] == [b.timestamp for b in bars(closes)]
 
 
-def test_symbol_preserved() -> None:
+def test_symbols_are_tracked_independently() -> None:
     bus = EventBus()
-    signals: list[SignalEvent] = []
-    bus.subscribe(SignalEvent, signals.append)
     MACrossoverStrategy(fast=2, slow=3).register(bus)
-    for i in range(5):
-        bus.publish(_make_event("TSLA", 100.0 + i, i))
-    bus.run()
-    assert all(s.symbol == "TSLA" for s in signals)
+    cap = Capture(bus, SignalEvent)
+    # Interleave two symbols; only MSFT's series crosses.
+    events = []
+    for i, (a, m) in enumerate(zip([10, 10, 10, 10, 10], [10, 9, 8, 12, 14], strict=True)):
+        events += [bar(float(a), i, symbol="AAPL"), bar(float(m), i, symbol="MSFT")]
+    publish_all(bus, *events)
+    by_symbol = {
+        sym: [s.direction for s in cap[SignalEvent] if s.symbol == sym] for sym in ("AAPL", "MSFT")
+    }
+    assert Direction.BUY not in by_symbol["AAPL"]
+    assert Direction.BUY in by_symbol["MSFT"]
+
+
+@pytest.mark.parametrize(("fast", "slow"), [(10, 5), (5, 5), (0, 5)])
+def test_invalid_windows_raise(fast: int, slow: int) -> None:
+    with pytest.raises(ValueError, match="fast"):
+        MACrossoverStrategy(fast=fast, slow=slow)
+
+
+def test_unregistered_strategy_raises() -> None:
+    strategy = MACrossoverStrategy()
+    with pytest.raises(RuntimeError, match="register"):
+        strategy._on_market_data(bar(1.0))
