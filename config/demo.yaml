@@ -1,0 +1,18 @@
+# Reproduces the chart in the README:
+#
+#   trading-backtest --config config/demo.yaml --save-chart docs/images/backtest.png
+#
+# Two years of synthetic daily bars (default seed), a 400-share target position
+# and a looser drawdown breaker than the default so the strategy keeps trading.
+
+simulation:
+  n_bars: 504
+
+order_manager:
+  quantity: 400
+
+risk:
+  max_drawdown_pct: 25.0
+
+persistence:
+  enabled: false
