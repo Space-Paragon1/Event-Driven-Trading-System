@@ -96,7 +96,14 @@ class SQLiteWriter:
     def __init__(self, db_path: str, run_id: str) -> None:
         self.run_id = run_id
         self._conn = sqlite3.connect(db_path)
-        self._init_schema(db_path)
+        try:
+            self._init_schema(db_path)
+        except sqlite3.DatabaseError as exc:
+            self._conn.close()
+            raise DataError(f"{db_path} is not a usable SQLite database: {exc}") from exc
+        except BaseException:
+            self._conn.close()
+            raise
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -144,7 +151,6 @@ class SQLiteWriter:
             is not None
         )
         if (version == 0 and has_tables) or version > SCHEMA_VERSION:
-            self._conn.close()
             raise DataError(
                 f"{db_path} uses an incompatible schema (version {version}, expected "
                 f"{SCHEMA_VERSION}). Delete it or choose a different persistence.db_path."

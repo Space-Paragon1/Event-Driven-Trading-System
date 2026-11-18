@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -21,7 +22,7 @@ TABLES = (
 
 
 def _count(path: Path, table: str, run_id: str | None = None) -> int:
-    with sqlite3.connect(path) as conn:
+    with closing(sqlite3.connect(path)) as conn:
         if run_id is None:
             return int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
         sql = f"SELECT COUNT(*) FROM {table} WHERE run_id = ?"
@@ -49,7 +50,7 @@ def _write_run(path: Path, run_id: str) -> None:
 def test_schema_is_created_and_versioned(tmp_path: Path) -> None:
     path = tmp_path / "t.db"
     SQLiteWriter(str(path), "r1").close()
-    with sqlite3.connect(path) as conn:
+    with closing(sqlite3.connect(path)) as conn:
         names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         version = conn.execute("PRAGMA user_version").fetchone()[0]
     assert set(TABLES) <= names
@@ -74,7 +75,7 @@ def test_runs_are_kept_separate(tmp_path: Path) -> None:
 def test_run_row_has_config_and_report(tmp_path: Path) -> None:
     path = tmp_path / "t.db"
     _write_run(path, "run-a")
-    with sqlite3.connect(path) as conn:
+    with closing(sqlite3.connect(path)) as conn:
         cfg, rep, finished = conn.execute(
             "SELECT config_json, report_json, finished_at FROM runs WHERE run_id = 'run-a'"
         ).fetchone()
@@ -102,7 +103,15 @@ def test_exception_rolls_back_the_run(tmp_path: Path) -> None:
 
 def test_incompatible_legacy_schema_is_rejected(tmp_path: Path) -> None:
     path = tmp_path / "legacy.db"
-    with sqlite3.connect(path) as conn:
+    with closing(sqlite3.connect(path)) as conn:
         conn.execute("CREATE TABLE fills (fill_id TEXT)")
+        conn.commit()
     with pytest.raises(DataError, match="incompatible schema"):
+        SQLiteWriter(str(path), "r1")
+
+
+def test_non_database_file_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "not-a-db.db"
+    path.write_bytes(b"this is not sqlite" * 100)
+    with pytest.raises(DataError, match="not a usable SQLite database"):
         SQLiteWriter(str(path), "r1")

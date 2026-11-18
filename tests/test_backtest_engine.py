@@ -210,10 +210,11 @@ def test_csv_data_source(tmp_path: Path) -> None:
 
 def test_persistence_writes_one_run(tmp_path: Path) -> None:
     import sqlite3
+    from contextlib import closing
 
     db = tmp_path / "runs.db"
     result = _run(**{"persistence.enabled": True, "persistence.db_path": str(db)})
-    with sqlite3.connect(db) as conn:
+    with closing(sqlite3.connect(db)) as conn:
         (run_id,) = conn.execute("SELECT run_id FROM runs").fetchone()
         n_updates = conn.execute("SELECT COUNT(*) FROM portfolio_updates").fetchone()[0]
     assert run_id == result.run_id
