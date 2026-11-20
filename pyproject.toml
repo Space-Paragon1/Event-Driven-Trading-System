@@ -1,18 +1,119 @@
 [build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.backends.legacy:build"
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "event-driven-trading-system"
-version = "0.1.0"
-description = "Event-driven trading system skeleton"
+version = "0.2.0"
+description = "A causal, event-driven backtesting engine with risk management, realistic execution and rich performance analytics."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Alex Chidera Umeasalugo" }]
 requires-python = ">=3.11"
+keywords = ["backtesting", "trading", "event-driven", "quant", "finance"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Office/Business :: Financial :: Investment",
+    "Typing :: Typed",
+]
+dependencies = ["pyyaml>=6.0"]
+
+[project.optional-dependencies]
+data = ["yfinance>=0.2.40"]
+viz = ["matplotlib>=3.7"]
+all = ["event-driven-trading-system[data,viz]"]
+dev = [
+    "event-driven-trading-system[all]",
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "hypothesis>=6.100",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "types-PyYAML",
+    "pre-commit>=3.7",
+]
+
+[project.scripts]
+trading-backtest = "trading.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+trading = ["py.typed"]
+
+# --------------------------------------------------------------------------- pytest
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-python_files = ["test_*.py"]
-python_functions = ["test_*"]
 pythonpath = ["src"]
+addopts = ["-ra", "--strict-markers", "--strict-config"]
+filterwarnings = [
+    "error",
+    # Third-party deprecations are not ours to fix; our own still fail the build.
+    "ignore::DeprecationWarning:^(?!trading)",
+    "ignore::PendingDeprecationWarning:^(?!trading)",
+]
+
+[tool.coverage.run]
+source = ["trading"]
+branch = true
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+skip_covered = true
+exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError", "\\.\\.\\."]
+
+# --------------------------------------------------------------------------- ruff
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes
+    "I",        # isort
+    "B",        # bugbear
+    "UP",       # pyupgrade
+    "SIM",      # simplify
+    "C4",       # comprehensions
+    "RUF",      # ruff-specific
+    "PT",       # pytest style
+    "PL",       # pylint subset
+]
+ignore = [
+    "PLR0913",  # many-arguments: constructors mirror config sections
+    "PLR2004",  # magic values: fine in tests and thresholds
+    "PLR0911",  # many returns
+    "PLR0912",  # many branches: config coercion is a flat type switch
+    "PLR0915",  # many statements: plotting code is linear
+    "PLR0917",  # positional args: constructors mirror config sections
+    "PLC0415",  # import-outside-top-level: optional deps are imported lazily on purpose
+    "RUF001",   # ambiguous unicode in strings (→, ▲, ·) is intentional output
+    "RUF002",
+]
+
+# --------------------------------------------------------------------------- mypy
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src"]
+strict = true
+warn_unreachable = true
+
+[[tool.mypy.overrides]]
+module = ["yfinance", "yfinance.*"]
+ignore_missing_imports = true

@@ -41,3 +41,11 @@ desktop.ini
 .env
 .env.*
 secrets.json
+.hypothesis/
+
+# ── Backtest outputs ─────────────────────────────────────────────────────────
+*.db
+*.db-journal
+/*.png
+/*.svg
+/*.pdf

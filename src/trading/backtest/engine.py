@@ -1,195 +1,190 @@
-"""Backtest engine — wires the full pipeline from a config dict and runs it."""
+"""Backtest engine — wires the pipeline from a config and drives it bar by bar."""
 
 from __future__ import annotations
 
+import contextlib
+import logging
+import uuid
 from dataclasses import dataclass
+from datetime import datetime
+from typing import Any
 
-from trading.bus.event_bus import EventBus
+from trading.bus.event_bus import Component, EventBus
+from trading.config import BacktestConfig
+from trading.errors import DataError
+from trading.events.types import EndOfBarEvent, FillEvent
 from trading.execution.simulator import ExecutionSimulator
 from trading.logger.handler import EventLogger
-from trading.market_data.feed import MarketDataFeed
+from trading.market_data.csv_loader import CSVFeed
+from trading.market_data.feed import Feed, SyntheticFeed
 from trading.market_data.yfinance_loader import YFinanceFeed
 from trading.metrics.calculator import PerformanceMetrics, PerformanceReport
+from trading.metrics.trades import Trade
 from trading.order_manager.manager import OrderManager
 from trading.persistence.sqlite_writer import SQLiteWriter
 from trading.portfolio.tracker import PortfolioTracker
 from trading.risk.manager import RiskManager
-from trading.signal.generator import SignalGenerator
-from trading.signal.ma_crossover import MACrossoverStrategy
-from trading.signal.rsi import RSIStrategy
-from trading.visualization.chart import EquityChart
+from trading.signal.base import Strategy
+from trading.signal.registry import build_strategy
+
+log = logging.getLogger(__name__)
 
 
-@dataclass
-class BacktestReport:
-    performance: PerformanceReport
-    n_ticks: int
-    symbol: str
+@dataclass(frozen=True)
+class BacktestResult:
+    """Everything a run produced: the report plus the series needed to analyse or plot it."""
+
+    run_id: str
+    config: BacktestConfig
+    strategy: str
+    report: PerformanceReport
+    equity_curve: tuple[tuple[datetime, float], ...]
+    prices: tuple[tuple[datetime, float], ...]
+    fills: tuple[FillEvent, ...]
+    trades: tuple[Trade, ...]
+
+    @property
+    def symbol(self) -> str:
+        return self.config.simulation.symbol
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "symbol": self.symbol,
+            "strategy": self.strategy,
+            "data_source": self.config.simulation.data_source,
+            "metrics": self.report.to_dict(),
+        }
 
     def __str__(self) -> str:
-        return (
-            f"\nBacktest: {self.symbol}  ({self.n_ticks} ticks)\n"
-            + str(self.performance)
+        sim = self.config.simulation
+        first = self.prices[0][0].date() if self.prices else "-"
+        last = self.prices[-1][0].date() if self.prices else "-"
+        header = (
+            f"\nBacktest  {self.symbol} | {self.strategy} | {sim.data_source} data | "
+            f"{self.report.n_bars} bars ({first} to {last})"
         )
+        return header + "\n" + str(self.report)
 
 
 class BacktestEngine:
-    """Wires every component from *config* and runs a full simulation.
+    """Builds every component from a :class:`BacktestConfig` and runs the simulation.
 
-    Config keys (all optional — defaults shown):
+    **The event loop.** For each bar the engine:
 
-    .. code-block:: yaml
+    1. publishes the :class:`MarketDataEvent` and drains the bus, which lets
+       the whole cascade (fills for orders from the previous bar, the new
+       signal, the order, the risk decision) settle, and then
+    2. publishes an :class:`EndOfBarEvent` and drains again, which triggers the
+       portfolio's mark-to-market snapshot.
 
-        simulation:
-          symbol: AAPL
-          n_ticks: 100
-          seed: 42
-          data_source: synthetic   # or "yfinance"
-          start: "2024-01-01"      # yfinance only
-          end:   "2024-12-31"      # yfinance only
-          interval: "1d"           # yfinance only
-        strategy:
-          type: ma_crossover   # "ma_crossover", "rsi", or "random"
-          fast_period: 5
-          slow_period: 20
-          period: 14           # rsi
-          overbought: 70.0     # rsi
-          oversold: 30.0       # rsi
-        order_manager:
-          quantity: 100
-        execution:
-          slippage_bps: 1
-          commission_per_share: 0.01
-        risk:
-          max_position: 500
-          max_drawdown_pct: 10.0
-        portfolio:
-          starting_cash: 100000.0
-        persistence:
-          enabled: true
-          db_path: trading.db
-        visualization:
-          enabled: false
-          save_path: equity_curve.png
+    Only then is the next bar read. Every component therefore sees a strictly
+    causal stream, and orders placed on bar *t* fill on bar *t+1*.
 
     Args:
-        config:          Nested dict (typically loaded from YAML).
-        enable_db:       Override ``persistence.enabled``; useful for tests.
-        enable_chart:    Override ``visualization.enabled``; show chart after run.
-        chart_save_path: If set, save chart to this path instead of displaying.
+        config:   Run configuration.
+        feed:     Optional feed override (defaults to the one in *config*).
+        strategy: Optional strategy override, e.g. a custom :class:`Strategy`
+                  subclass that is not in the registry.
     """
 
     def __init__(
         self,
-        config: dict,
-        enable_db: bool | None = None,
-        enable_chart: bool | None = None,
-        chart_save_path: str | None = None,
+        config: BacktestConfig | None = None,
+        *,
+        feed: Feed | None = None,
+        strategy: Strategy | None = None,
     ) -> None:
-        self._config = config
-        self._enable_db = enable_db
-        self._enable_chart = enable_chart
-        self._chart_save_path = chart_save_path
+        self.config = config or BacktestConfig()
+        self._feed = feed
+        self._strategy = strategy
 
-    # ------------------------------------------------------------------
+    def run(self) -> BacktestResult:
+        cfg = self.config
+        run_id = uuid.uuid4().hex[:12]
+        cash = cfg.portfolio.starting_cash
 
-    def run(self) -> BacktestReport:
-        cfg = self._config
-        sim_cfg = cfg.get("simulation", {})
-        strat_cfg = cfg.get("strategy", {})
-        om_cfg = cfg.get("order_manager", {})
-        exec_cfg = cfg.get("execution", {})
-        risk_cfg = cfg.get("risk", {})
-        port_cfg = cfg.get("portfolio", {})
-        pers_cfg = cfg.get("persistence", {})
-        viz_cfg = cfg.get("visualization", {})
-
-        symbol: str = sim_cfg.get("symbol", "AAPL")
-        n_ticks: int = int(sim_cfg.get("n_ticks", 100))
-        seed: int | None = sim_cfg.get("seed")
-        starting_cash: float = float(port_cfg.get("starting_cash", 100_000.0))
+        feed = self._feed if self._feed is not None else build_feed(cfg)
+        strategy = (
+            self._strategy
+            if self._strategy is not None
+            else build_strategy(cfg.strategy, cfg.simulation.seed)
+        )
+        strategy_name = strategy.name
+        execution = ExecutionSimulator(
+            slippage_bps=cfg.execution.slippage_bps,
+            commission_per_share=cfg.execution.commission_per_share,
+        )
+        metrics = PerformanceMetrics(
+            starting_equity=cash,
+            periods_per_year=cfg.periods_per_year,
+            risk_free_rate=cfg.metrics.risk_free_rate,
+        )
 
         bus = EventBus()
-        feed = self._build_feed(sim_cfg)
-        strategy = self._build_strategy(strat_cfg, seed)
-        order_mgr = OrderManager(quantity=int(om_cfg.get("quantity", 100)))
-        exec_sim = ExecutionSimulator(
-            slippage_bps=float(exec_cfg.get("slippage_bps", 1)),
-            commission_per_share=float(exec_cfg.get("commission_per_share", 0.01)),
-            seed=seed,
-        )
-        risk_mgr = RiskManager(
-            max_position=int(risk_cfg.get("max_position", 500)),
-            max_drawdown_pct=float(risk_cfg.get("max_drawdown_pct", 10.0)),
-            starting_equity=starting_cash,
-        )
-        portfolio = PortfolioTracker(starting_cash=starting_cash)
-        metrics = PerformanceMetrics(starting_equity=starting_cash)
-        event_log = EventLogger()
+        components: list[Component] = [
+            execution,
+            PortfolioTracker(starting_cash=cash),
+            strategy,
+            OrderManager(cfg.order_manager.quantity, cfg.order_manager.allow_short),
+            RiskManager(cfg.risk.max_position, cfg.risk.max_drawdown_pct, starting_equity=cash),
+            metrics,
+            EventLogger(),
+        ]
 
-        db: SQLiteWriter | None = None
-        db_enabled = self._enable_db if self._enable_db is not None else pers_cfg.get("enabled", True)
-        if db_enabled:
-            db = SQLiteWriter(db_path=pers_cfg.get("db_path", "trading.db"))
+        with contextlib.ExitStack() as stack:
+            db: SQLiteWriter | None = None
+            if cfg.persistence.enabled:
+                db = stack.enter_context(SQLiteWriter(cfg.persistence.db_path, run_id))
+                db.start_run(symbol=feed.symbol, strategy=strategy_name, config=cfg.to_dict())
+                components.append(db)
 
-        chart: EquityChart | None = None
-        chart_enabled = (
-            self._enable_chart
-            if self._enable_chart is not None
-            else viz_cfg.get("enabled", False)
-        )
-        if chart_enabled:
-            chart = EquityChart()
+            for component in components:
+                component.register(bus)
 
-        for component in [strategy, order_mgr, risk_mgr, exec_sim, portfolio, metrics, event_log]:
-            component.register(bus)
-        if db:
-            db.register(bus)
-        if chart:
-            chart.register(bus)
+            for bar in feed:
+                bus.publish(bar)
+                bus.run()
+                bus.publish(EndOfBarEvent(symbol=bar.symbol, timestamp=bar.timestamp))
+                bus.run()
 
-        feed.emit(bus)
-        bus.run()
+            if not metrics.equity_curve:
+                raise DataError(f"the {cfg.simulation.data_source} feed produced no bars")
+            if execution.working_orders:
+                log.info(
+                    "%d order(s) still working when the data ended (never filled)",
+                    execution.working_orders,
+                )
 
-        if db:
-            db.close()
+            report = metrics.report()
+            if db is not None:
+                db.finish_run(report.to_dict())
 
-        if chart:
-            save = self._chart_save_path or viz_cfg.get("save_path") or None
-            chart.plot(symbol=symbol, save_path=save)
-
-        report = metrics.report()
-        return BacktestReport(performance=report, n_ticks=n_ticks, symbol=symbol)
-
-    # ------------------------------------------------------------------
-
-    def _build_feed(self, sim_cfg: dict) -> object:
-        source = sim_cfg.get("data_source", "synthetic")
-        symbol = sim_cfg.get("symbol", "AAPL")
-        if source == "yfinance":
-            return YFinanceFeed(
-                symbol=symbol,
-                start=sim_cfg.get("start", "2024-01-01"),
-                end=sim_cfg.get("end", "2024-12-31"),
-                interval=sim_cfg.get("interval", "1d"),
-            )
-        return MarketDataFeed(
-            symbol=symbol,
-            n_ticks=int(sim_cfg.get("n_ticks", 100)),
-            seed=sim_cfg.get("seed"),
+        return BacktestResult(
+            run_id=run_id,
+            config=cfg,
+            strategy=strategy_name,
+            report=report,
+            equity_curve=tuple(metrics.equity_curve),
+            prices=tuple(metrics.prices),
+            fills=tuple(metrics.fills),
+            trades=tuple(metrics.trades),
         )
 
-    def _build_strategy(self, strat_cfg: dict, seed: int | None) -> object:
-        strategy_type = strat_cfg.get("type", "ma_crossover")
-        if strategy_type == "ma_crossover":
-            return MACrossoverStrategy(
-                fast=int(strat_cfg.get("fast_period", 5)),
-                slow=int(strat_cfg.get("slow_period", 20)),
-            )
-        if strategy_type == "rsi":
-            return RSIStrategy(
-                period=int(strat_cfg.get("period", 14)),
-                overbought=float(strat_cfg.get("overbought", 70.0)),
-                oversold=float(strat_cfg.get("oversold", 30.0)),
-            )
-        return SignalGenerator(seed=seed)
+
+def build_feed(cfg: BacktestConfig) -> Feed:
+    """Construct the feed described by ``cfg.simulation``."""
+    sim = cfg.simulation
+    if sim.data_source == "yfinance":
+        return YFinanceFeed(sim.symbol, start=sim.start, end=sim.end, interval=sim.interval)
+    if sim.data_source == "csv":
+        assert sim.csv_path is not None  # guaranteed by SimulationConfig validation
+        return CSVFeed(sim.csv_path, symbol=sim.symbol)
+    return SyntheticFeed(
+        sim.symbol,
+        n_bars=sim.n_bars,
+        seed=sim.seed,
+        start_price=sim.start_price,
+        annual_drift=sim.annual_drift,
+        annual_volatility=sim.annual_volatility,
+    )

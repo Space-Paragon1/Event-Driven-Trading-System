@@ -2,90 +2,90 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+import pytest
 
+from tests.factories import Capture, approved, bar, publish_all
 from trading.bus.event_bus import EventBus
-from trading.events.types import ApprovedOrderEvent, Direction, FillEvent, OrderType
+from trading.events.types import Direction, FillEvent, OrderType
 from trading.execution.simulator import ExecutionSimulator
 
-_REF_PRICE = 200.0
+BUY, SELL = Direction.BUY, Direction.SELL
 
 
-def _make_order(
-    direction: Direction = Direction.BUY,
-    quantity: int = 100,
-    price: float = _REF_PRICE,
-) -> ApprovedOrderEvent:
-    return ApprovedOrderEvent(
-        order_id="test-order-id",
-        symbol="AAPL",
-        timestamp=datetime(2024, 1, 2, 9, 30),
-        order_type=OrderType.MARKET,
-        direction=direction,
-        quantity=quantity,
-        price=price,
-    )
-
-
-def _run(order: ApprovedOrderEvent, seed: int = 0) -> FillEvent:
+def _setup(**kwargs: float) -> tuple[EventBus, ExecutionSimulator, Capture]:
     bus = EventBus()
-    fills: list[FillEvent] = []
-    bus.subscribe(FillEvent, fills.append)
-    ExecutionSimulator(seed=seed).register(bus)
-    bus.publish(order)
-    bus.run()
-    assert len(fills) == 1
-    return fills[0]
-
-
-def test_fill_created_for_market_order() -> None:
-    fill = _run(_make_order())
-    assert isinstance(fill, FillEvent)
-
-
-def test_fill_references_correct_order_id() -> None:
-    order = _make_order()
-    fill = _run(order)
-    assert fill.order_id == order.order_id
-
-
-def test_fill_direction_matches_order() -> None:
-    for direction in (Direction.BUY, Direction.SELL):
-        fill = _run(_make_order(direction=direction))
-        assert fill.direction is direction
-
-
-def test_fill_quantity_matches_order() -> None:
-    fill = _run(_make_order(quantity=500))
-    assert fill.quantity == 500
-
-
-def test_fill_price_within_slippage_band() -> None:
-    sim = ExecutionSimulator(slippage_bps=1, seed=0)
-    bus = EventBus()
-    fills: list[FillEvent] = []
-    bus.subscribe(FillEvent, fills.append)
+    sim = ExecutionSimulator(**kwargs)
     sim.register(bus)
-    bus.publish(_make_order(price=_REF_PRICE))
-    bus.run()
-
-    fill = fills[0]
-    max_slip = _REF_PRICE * (1 / 10_000)  # 1 bps
-    assert abs(fill.fill_price - _REF_PRICE) <= max_slip + 1e-9
+    return bus, sim, Capture(bus, FillEvent)
 
 
-def test_commission_calculation() -> None:
-    fill = _run(_make_order(quantity=100))
-    assert abs(fill.commission - 1.00) < 1e-6  # $0.01 × 100 = $1.00
+def test_order_is_not_filled_until_next_bar() -> None:
+    bus, sim, cap = _setup()
+    publish_all(bus, bar(100.0, 0), approved(BUY, i=0))
+    assert cap[FillEvent] == []
+    assert sim.working_orders == 1
+
+    publish_all(bus, bar(102.0, 1, open=101.0))
+    (f,) = cap[FillEvent]
+    assert f.timestamp == bar(0.0, 1).timestamp
+    assert sim.working_orders == 0
 
 
-def test_fill_id_is_unique() -> None:
-    bus = EventBus()
-    fills: list[FillEvent] = []
-    bus.subscribe(FillEvent, fills.append)
-    ExecutionSimulator().register(bus)
-    for _ in range(5):
-        bus.publish(_make_order())
-    bus.run()
-    ids = [f.fill_id for f in fills]
-    assert len(set(ids)) == len(ids), "fill IDs must be unique"
+def test_fills_at_next_open_with_adverse_slippage() -> None:
+    bus, _, cap = _setup(slippage_bps=10, commission_per_share=0.0)
+    publish_all(
+        bus,
+        approved(BUY, order_id="B"),
+        approved(SELL, order_id="S"),
+        bar(close=250.0, i=1, open=200.0),
+    )
+    by_id = {f.order_id: f for f in cap[FillEvent]}
+    assert by_id["B"].fill_price == pytest.approx(200.0 * 1.001)
+    assert by_id["S"].fill_price == pytest.approx(200.0 * 0.999)
+
+
+def test_zero_slippage_fills_exactly_at_open() -> None:
+    bus, _, cap = _setup(slippage_bps=0)
+    publish_all(bus, approved(BUY), bar(close=99.0, i=1, open=98.76))
+    assert cap[FillEvent][0].fill_price == 98.76
+
+
+def test_fill_mirrors_order() -> None:
+    bus, _, cap = _setup()
+    o = approved(SELL, 500, order_id="X42")
+    publish_all(bus, o, bar(100.0, 1))
+    f = cap[FillEvent][0]
+    assert (f.order_id, f.direction, f.quantity, f.symbol) == ("X42", SELL, 500, "AAPL")
+
+
+def test_commission_per_share() -> None:
+    bus, _, cap = _setup(commission_per_share=0.005)
+    publish_all(bus, approved(BUY, 300), bar(100.0, 1))
+    assert cap[FillEvent][0].commission == pytest.approx(1.5)
+
+
+def test_bars_for_other_symbols_do_not_fill() -> None:
+    bus, sim, cap = _setup()
+    publish_all(bus, approved(BUY, symbol="AAPL"), bar(100.0, 1, symbol="MSFT"))
+    assert cap[FillEvent] == []
+    assert sim.working_orders == 1
+
+
+def test_fill_ids_are_unique() -> None:
+    bus, _, cap = _setup()
+    publish_all(bus, *[approved(BUY, order_id=f"O{i}") for i in range(5)], bar(100.0, 1))
+    ids = [f.fill_id for f in cap[FillEvent]]
+    assert len(set(ids)) == 5
+
+
+def test_limit_orders_are_rejected() -> None:
+    bus, _, _ = _setup()
+    bus.publish(approved(BUY, order_type=OrderType.LIMIT))
+    with pytest.raises(ValueError, match="MARKET"):
+        bus.run()
+
+
+@pytest.mark.parametrize("kwargs", [{"slippage_bps": -1}, {"commission_per_share": -0.01}])
+def test_negative_costs_raise(kwargs: dict[str, float]) -> None:
+    with pytest.raises(ValueError, match="non-negative"):
+        ExecutionSimulator(**kwargs)
